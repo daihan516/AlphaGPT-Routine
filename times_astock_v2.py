@@ -1042,6 +1042,25 @@ def final_reality_check(engine, miner):
 # ==============================================================================
 # 8. 每日信号推送
 # ==============================================================================
+def next_trading_day(after):
+    """返回 after 之后的第一个交易日（含节假日）。失败则回退为下一个工作日。"""
+    try:
+        bs = _bs_login_once()
+        start = (after + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        end = (after + pd.Timedelta(days=20)).strftime("%Y-%m-%d")
+        rs = bs.query_trade_dates(start_date=start, end_date=end)
+        while rs.error_code == "0" and rs.next():
+            d, flag = rs.get_row_data()
+            if flag == "1":
+                return pd.Timestamp(d)
+    except Exception:
+        pass
+    d = after + pd.Timedelta(days=1)
+    while d.weekday() >= 5:
+        d += pd.Timedelta(days=1)
+    return d
+
+
 def report_latest(engine, miner, n_days=10):
     factor = miner.solve_one(miner.best_formula_tokens)
     split = engine.split_idx
@@ -1055,7 +1074,14 @@ def report_latest(engine, miner, n_days=10):
     sig_prev = np.tanh(f_np[:, -2]) > 0
     buys = [engine.codes[i] for i in range(len(engine.codes)) if sig_now[i]]
 
-    print(f"\n{'='*72}\n最新信号（{dates[-1].date()} 收盘 → 下一交易日开盘）\n{'='*72}")
+    last_date = pd.Timestamp(dates[-1])
+    exec_date = next_trading_day(last_date)
+    today = pd.Timestamp(datetime.today().date())
+    if last_date < today - pd.Timedelta(days=1) and exec_date <= today:
+        print(f"\n[!] 注意：最新数据日期 {last_date.date()}，执行日 {exec_date.date()} 可能已过，"
+              f"请确认数据源是否滞后")
+
+    print(f"\n{'='*72}\n最新信号：{last_date.date()} 收盘 → 执行日 {exec_date.date()} 开盘\n{'='*72}")
     print(f"{'标的':<16}{'信号':<8}{'前一日':<8}{'当前可买':<10}{'因子值':>10}")
     for i, code in enumerate(engine.codes):
         print(f"{_name(code):<16}{'买入' if sig_now[i] else '—':<8}"
@@ -1063,15 +1089,15 @@ def report_latest(engine, miner, n_days=10):
               f"{'是' if engine.entry_ok[i, -1] else '否':<10}{f_np[i, -1]:>10.3f}")
     print("-" * 72)
     if buys:
-        print(f"→ 下一交易日开盘买入 {len(buys)} 只: " + "、".join(_name(c) for c in buys))
+        print(f"→ {exec_date.date()} 开盘买入 {len(buys)} 只: " + "、".join(_name(c) for c in buys))
     else:
-        print("→ 下一交易日无买入信号（空仓/继续持有现有仓位）")
+        print(f"→ {exec_date.date()} 无买入信号（空仓/继续持有现有仓位）")
     print(f"样本外组合（等权）: 累计 {pst['total']:.2%} | 年化 {pst['ann']:.2%} | "
           f"索提诺 {pst['sortino']:.2f} | 最大回撤 {pst['max_dd']:.2%}")
 
     # ---- 钉钉 ----
     lines = [f"## 📊 AlphaGPT v2 [{len(engine.codes)}只池]", ""]
-    lines.append(f"**{dates[-1].date()} 收盘信号 → 下一交易日开盘**")
+    lines.append(f"**信号：{last_date.date()} 收盘**  →  **执行：{exec_date.date()} 开盘**")
     if buys:
         for c in buys:
             lines.append(f"- ✅ 买入 **{_name(c)}**")
