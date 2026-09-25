@@ -2,8 +2,29 @@ name: A-Stock AlphaGPT routine
 
 on:
   schedule:
-    - cron: '13 8 * * *'
+    - cron: '13 8 * * *'      # UTC 08:13 = 北京时间 16:13（收盘后）
   workflow_dispatch:
+    inputs:
+      version:
+        description: '版本：v2=横截面优化版（默认）, v1=原始单标的版'
+        required: false
+        default: 'v2'
+      best_formula:
+        description: '指定公式（留空则用仓库变量 BEST_FORMULA；再留空则现场训练）'
+        required: false
+        default: ''
+      train_iterations:
+        description: '训练轮数覆盖（留空则用仓库变量）'
+        required: false
+        default: ''
+      start_date:
+        description: '数据起始日 YYYYMMDD（留空则用仓库变量）'
+        required: false
+        default: ''
+      end_date:
+        description: '数据结束日 YYYYMMDD（留空则用仓库变量）'
+        required: false
+        default: ''
 
 jobs:
   analyze:
@@ -24,22 +45,37 @@ jobs:
 
       - name: Run analysis
         env:
-          CODE_FORMULA: ${{ github.event.inputs.code_formula || vars.CODE_FORMULA || secrets.CODE_FORMULA }}
-          INDEX_CODE: ${{ vars.INDEX_CODE || secrets.INDEX_CODE || '600901' }}
+          # --- v2 横截面参数 ---
+          UNIVERSE: ${{ vars.UNIVERSE || '600519,600036,601318,600030,600276,600887,601899,600900,601088,600309,601166,600585' }}
+          HOLD_PERIOD: ${{ vars.HOLD_PERIOD || 5 }}
+          SEED: ${{ vars.SEED || 42 }}
+          MIN_TRADES: ${{ vars.MIN_TRADES || 12 }}
+          MIN_STOCK_PASS: ${{ vars.MIN_STOCK_PASS || 0.9 }}
+          # 因子集（留空 = 全部 6 个含两融；深市股票无两融数据时建议只用价量因子）
+          FACTORS: ${{ vars.FACTORS || 'RET,RET5,VOL_CHG,V_RET,TREND' }}
+          # --- 通用 ---
           START_DATE: ${{ github.event.inputs.start_date || vars.START_DATE || '20220101' }}
-          END_DATE: ${{ github.event.inputs.end_date || vars.END_DATE || '20270101' }}
+          END_DATE: ${{ github.event.inputs.end_date || vars.END_DATE || '20261231' }}
           BATCH_SIZE: ${{ vars.BATCH_SIZE || 1024 }}
-          TRAIN_ITERATIONS: ${{ vars.TRAIN_ITERATIONS || 100 }}
+          TRAIN_ITERATIONS: ${{ github.event.inputs.train_iterations || vars.TRAIN_ITERATIONS || 200 }}
           MAX_SEQ_LEN: ${{ vars.MAX_SEQ_LEN || 10 }}
-          COST_RATE: ${{ vars.COST_RATE || 0.0004 }}
-          LAST_NDAYS: ${{ vars.LAST_NDAYS || 50 }}
-          HOLD_PERIOD: ${{ vars.HOLD_PERIOD || 11 }}
-          FORCE_TRAIN: ${{ vars.FORCE_TRAIN || 'False' }}
+          FORCE_TRAIN: ${{ vars.FORCE_TRAIN || 'True' }}
           ONLY_LONG: ${{ vars.ONLY_LONG || 'True' }}
-          BEST_FORMULA: ${{ vars.BEST_FORMULA || secrets.BEST_FORMULA || '' }}
+          LAST_NDAYS: ${{ vars.LAST_NDAYS || 10 }}
+          BEST_FORMULA: ${{ github.event.inputs.best_formula || vars.BEST_FORMULA || '' }}
+          # v1 兼容参数
+          INDEX_CODE: ${{ vars.INDEX_CODE || '' }}
+          # 钉钉
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK || '' }}
           DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET || '' }}
-        run: python times_astock.py
+        run: |
+          VERSION="${{ github.event.inputs.version || 'v2' }}"
+          echo "运行版本: $VERSION"
+          if [ "$VERSION" = "v1" ]; then
+            python times_astock.py
+          else
+            python times_astock_v2.py
+          fi
 
       - name: Commit and push changes
         run: |

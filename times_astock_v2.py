@@ -84,10 +84,14 @@ _DEFAULT_UNIVERSE = (
     "600519,600036,601318,600030,600276,600887,"
     "601899,600900,601088,600309,601166,600585"
 )
-UNIVERSE = [c.strip() for c in _get_env("UNIVERSE", _DEFAULT_UNIVERSE).split(",") if c.strip()]
+_UNIVERSE_ENV = os.environ.get("UNIVERSE", "").strip()
 _INDEX_CODE_ENV = os.environ.get("INDEX_CODE", "").strip()
-if _INDEX_CODE_ENV:                       # 兼容单标的用法
+if _UNIVERSE_ENV:                         # UNIVERSE 优先（显式指定标的池）
+    UNIVERSE = [c.strip() for c in _UNIVERSE_ENV.split(",") if c.strip()]
+elif _INDEX_CODE_ENV:                     # 兼容 v1 的单标的用法
     UNIVERSE = [c.strip() for c in _INDEX_CODE_ENV.split(",") if c.strip()]
+else:
+    UNIVERSE = [c.strip() for c in _DEFAULT_UNIVERSE.split(",") if c.strip()]
 INDEX_CODE = UNIVERSE[0]                  # 用于文件命名与推送标题
 STOCK_NAMES = {
     "600519": "贵州茅台", "600036": "招商银行", "601318": "中国平安", "600030": "中信证券",
@@ -119,7 +123,7 @@ SELL_COST = COMMISSION_RATE + TRANSFER_FEE_RATE + STAMP_TAX_RATE + SLIPPAGE_RATE
 
 # ---- 奖励函数（原始版核心）----
 MIN_TRADES = _get_env("MIN_TRADES", 12, int)        # 【单只】交易次数下限，不足则淘汰该标的
-MIN_STOCK_PASS = _get_env("MIN_STOCK_PASS", 0.6, float)  # 至少多少比例的标的达标，公式才算有效
+MIN_STOCK_PASS = _get_env("MIN_STOCK_PASS", 0.9, float)  # 至少多少比例的标的达标，公式才算有效
 BATCH_CHUNK = _get_env("BATCH_CHUNK", 64, int)       # 回测分块大小（控制内存）
 MAX_DD_PENALTY = _get_env("MAX_DD_PENALTY", 3.0, float)   # 回撤超阈值后的惩罚系数
 DD_THRESHOLD = _get_env("DD_THRESHOLD", 0.25, float)      # 回撤惩罚阈值
@@ -218,7 +222,18 @@ OPS_CONFIG = [
     ("MAX3", lambda x: torch.max(x, torch.max(_ts_delay(x, 1), _ts_delay(x, 2))), 1),
 ]
 
-FEATURES = ["RET", "RET5", "VOL_CHG", "V_RET", "TREND", "MARGIN_NET"]
+# 全部可选因子（固定顺序，"MARGIN_NET" 由两融矩阵单独填充）
+_ALL_FACTORS = ["RET", "RET5", "VOL_CHG", "V_RET", "TREND", "MARGIN_NET"]
+# 实际使用的因子集：可用环境变量控制，逗号分隔。
+# 例：FACTORS=RET,RET5,VOL_CHG,V_RET,TREND  → 只用价量因子（全市场数据完整）
+_FACTORS_ENV = _get_env("FACTORS", "")
+FEATURES = [f.strip().upper() for f in (_FACTORS_ENV.split(",") if _FACTORS_ENV else _ALL_FACTORS)
+            if f.strip()]
+_bad = [f for f in FEATURES if f not in _ALL_FACTORS]
+if _bad:
+    raise ValueError(f"未知因子 {_bad}，可选: {_ALL_FACTORS}")
+if not FEATURES:
+    raise ValueError("至少选择一个因子")
 
 VOCAB = FEATURES + [cfg[0] for cfg in OPS_CONFIG]
 VOCAB_SIZE = len(VOCAB)
@@ -514,36 +529,47 @@ def fetch_daily(code):
         return df.sort_values("date").reset_index(drop=True), "baostock"
 
 
-def load_margin_matrix(codes, date_strs, cache_file="margin_universe_cache.parquet"):
-    """构建 [日期 × 标的] 的「融资净买入/融资余额」矩阵（带缓存）。"""
+def load_margin_balance_matrix(codes, date_strs, cache_file="margin_balance_matrix.parquet"):
+    """
+    构建 [日期 × 标的] 的「融资余额」矩阵，数据来源：
+      - 沪市：仓库自带的 margin_balance/YYYYMMDD_margin_data.parquet（按日，含「融资余额」）
+      - 深市：fetch_margin_szse.py 抓取的 margin_szse_cache.parquet
+
+    注意：深交所明细里**没有「融资偿还额」**字段，沪市有。
+    所以 v2 统一改用「融资余额的变化率」作为因子 —— 两市都能算，口径一致：
+        MARGIN_NET = (余额[t] - 余额[t-1]) / |余额[t-1]|
+    """
     if os.path.exists(cache_file):
         try:
             mat = pd.read_parquet(cache_file)
             if set(date_strs).issubset(set(mat.index)) and set(codes).issubset(set(mat.columns)):
-                print(f"    两融矩阵命中缓存 {mat.shape}")
+                print(f"    两融余额矩阵命中缓存 {mat.shape}")
                 return mat.loc[date_strs, codes]
         except Exception:
             pass
-    rows = {}
-    for d in tqdm(date_strs, desc="    构建两融矩阵", leave=False):
+
+    bal = {}
+    for d in tqdm(date_strs, desc="    读取沪市两融", leave=False):
         fp = os.path.join("margin_balance", f"{d}_margin_data.parquet")
         if not os.path.exists(fp):
             continue
         try:
             df = pd.read_parquet(fp)
+            bal[d] = dict(zip(df["标的证券代码"], df["融资余额"]))
         except Exception:
             continue
-        buy = dict(zip(df["标的证券代码"], df["融资买入额"]))
-        rep = dict(zip(df["标的证券代码"], df["融资偿还额"]))
-        bal = dict(zip(df["标的证券代码"], df["融资余额"]))
-        rows[d] = {c: ((buy[c] - rep[c]) / abs(bal[c]))
-                   if (c in bal and abs(bal[c]) > 1e-6) else 0.0
-                   for c in codes}
-    mat = pd.DataFrame.from_dict(rows, orient="index")
-    mat = mat.reindex(index=date_strs, columns=codes).fillna(0.0)
+    n_sse = len(bal)
+    if os.path.exists("margin_szse_cache.parquet"):
+        sz = pd.read_parquet("margin_szse_cache.parquet")
+        for d, g in sz.groupby("date"):
+            bal.setdefault(str(d), {})
+            bal[str(d)].update(dict(zip(g["code"], g["balance"])))
+        print(f"    已合并深市两融 {sz['date'].nunique()} 天")
+
+    mat = pd.DataFrame.from_dict(bal, orient="index").reindex(index=date_strs, columns=codes)
     try:
         mat.to_parquet(cache_file)
-        print(f"    两融矩阵已缓存: {cache_file} {mat.shape}")
+        print(f"    两融余额矩阵已缓存 {cache_file} {mat.shape}")
     except Exception:
         pass
     return mat
@@ -602,20 +628,36 @@ class DataEngine:
               f"开盘跌停(卖不出) {1 - self.exit_ok.mean():.2%} 不可卖")
 
         # ---- 因子：全部 robust_norm ----
-        feats = np.zeros((N, len(FEATURES), T), dtype=np.float32)
+        full = np.zeros((N, len(_ALL_FACTORS), T), dtype=np.float32)
         for i in range(N):
-            feats[i] = self._features(open_[i], close_[i], vol_[i])
-        mi = FEATURES.index("MARGIN_NET")
+            full[i] = self._features(open_[i], close_[i], vol_[i])   # 固定 6 行顺序
+        mi = _ALL_FACTORS.index("MARGIN_NET")
+        if "MARGIN_NET" not in FEATURES:
+            print("    已跳过两融因子（FACTORS 未包含 MARGIN_NET）")
         try:
-            mat = load_margin_matrix(self.codes, self.dates.strftime("%Y%m%d").tolist())
-            mr = mat.values.astype(np.float64).T          # [N, T]
+            if "MARGIN_NET" not in FEATURES:
+                raise StopIteration
+            # 【修复】统一用「融资余额变化率」：沪市（自带缓存）+ 深市（fetch_margin_szse.py）都能算。
+            # v1 用的是「融资买入额 - 融资偿还额」，深交所明细没有「偿还额」字段，两市无法统一。
+            mat = load_margin_balance_matrix(self.codes, self.dates.strftime("%Y%m%d").tolist())
+            bal = mat.astype(np.float64)
+            chg = bal.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            chg = chg.clip(-0.5, 0.5)                     # 去掉极端值（增发/数据修正）
+            mr = chg.values.T                             # [N, T]
             for i in range(N):
-                feats[i, mi, :] = robust_norm(mr[i])
-            cov = float((np.abs(mr) > 1e-9).mean())
-            print(f"    两融因子覆盖率 {cov:.1%}"
-                  + ("  ← 偏低（非两融标的或非沪市）" if cov < 0.5 else ""))
+                full[i, mi, :] = robust_norm(mr[i])
+            valid_cols = (bal.notna().sum() > len(bal) * 0.5).sum()
+            print(f"    两融余额有效标的 {valid_cols}/{N}"
+                  + (f"  ← 部分标的缺两融数据（该因子对其恒为 0）" if valid_cols < N else ""))
+            for i, code in enumerate(self.codes):
+                if bal.iloc[:, i].notna().sum() <= len(bal) * 0.5:
+                    print(f"      [缺两融] {code}")
+        except StopIteration:
+            pass
         except Exception as e:
             print(f"    [!] 两融矩阵失败，该因子置 0: {e}")
+        sel = [_ALL_FACTORS.index(f) for f in FEATURES]
+        feats = full[:, sel, :]
         self.feat_data = torch.from_numpy(feats).to(DEVICE)      # [N, F, T]
         scale = ", ".join(f"{FEATURES[k]}={feats[:, k, :].std():.2f}" for k in range(len(FEATURES)))
         print(f"    因子量级: {scale}")

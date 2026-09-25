@@ -21,5 +21,6 @@ __pycache__/
 .DS_Store
 
 # v2 运行产物
-margin_universe_cache.parquet
+margin_balance_matrix.parquet
+margin_szse_cache.parquet
 strategy_performance_v2.png
