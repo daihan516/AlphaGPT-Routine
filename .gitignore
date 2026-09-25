@@ -1,0 +1,21 @@
+# 虚拟环境
+.venv/
+venv/
+
+# 本地配置（含密钥）
+config.env
+
+# 运行产物
+*_best_formula_*.txt
+*_metrics_*.txt
+*_data_cache_final.parquet
+strategy_performance.png
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
