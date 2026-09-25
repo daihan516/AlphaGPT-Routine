@@ -124,6 +124,10 @@ SELL_COST = COMMISSION_RATE + TRANSFER_FEE_RATE + STAMP_TAX_RATE + SLIPPAGE_RATE
 # ---- 奖励函数（原始版核心）----
 MIN_TRADES = _get_env("MIN_TRADES", 12, int)        # 【单只】交易次数下限，不足则淘汰该标的
 MIN_STOCK_PASS = _get_env("MIN_STOCK_PASS", 0.9, float)  # 至少多少比例的标的达标，公式才算有效
+TOP_N = _get_env("TOP_N", 5, int)                    # 【核心】组合持有股票数（横截面排序取前 N）
+MIN_PICKS = _get_env("MIN_PICKS", 3, int)            # 合格标的少于这个数就空仓（防止 100% 押一只）
+REQUIRE_POSITIVE = _get_env("REQUIRE_POSITIVE", True, bool)  # 只买 signal>0 的股票
+MIN_PORTFOLIO_TRADES = _get_env("MIN_PORTFOLIO_TRADES", 30, int)  # 组合交易次数下限
 BATCH_CHUNK = _get_env("BATCH_CHUNK", 64, int)       # 回测分块大小（控制内存）
 MAX_DD_PENALTY = _get_env("MAX_DD_PENALTY", 3.0, float)   # 回撤超阈值后的惩罚系数
 DD_THRESHOLD = _get_env("DD_THRESHOLD", 0.25, float)      # 回撤惩罚阈值
@@ -439,6 +443,124 @@ def simulate_batch(signal, open_, close_, entry_ok, exit_ok, hold_period):
         "n_trades": n_tr, "wins": wins, "forced": forced,
         "sum_net": sum_net, "best": best, "worst": worst,
         "avg_net": np.where(n_tr > 0, sum_net / np.maximum(n_tr, 1), 0.0),
+    }
+
+
+def simulate_topn_batch(factors, open_, close_, entry_ok, exit_ok, hold, n_top,
+                        require_positive=True):
+    """
+    【核心】横截面 Top-N 组合模拟 —— 对应原始版实盘 runner「按分数排序取前 N 只」的做法。
+
+    与 v1/旧 v2 的区别：
+      旧：每只股票各自出二值信号 → 30 只里常常 14 只同时买入 ≈ 半个指数（被稀释）
+      新：每天只在全池里挑因子值最高的 N 只持有，资金等权 → 真正的组合
+
+    规则：
+      - 空仓时每天看一次：取 signal>0 且当日可买 的股票中因子值前 N 只
+      - t 日收盘决策 → t+1 开盘等权买入（每只权重 1/N）
+      - 持有 hold 个交易日后卖出；跌停/停牌则顺延到能卖的那天
+      - 持仓期间不再调仓（等这一批全部平掉再重新选股）
+
+    factors: [B, N_stock, T] 原始因子值
+    返回 (daily_ret [B, T], stats dict)
+    """
+    B, N, T = factors.shape
+    hold = max(1, int(hold))
+    n_top = max(int(n_top), int(MIN_PICKS))
+    sig = np.tanh(factors)
+    daily = np.zeros((B, T), dtype=np.float64)
+    active = np.zeros((B, N), dtype=bool)
+    pos_cum = np.ones((B, N), dtype=np.float64)
+    m = np.zeros(B, dtype=np.int64)              # 本批持仓数
+    exit_target = np.zeros(B, dtype=np.int64)
+    holding = np.zeros(B, dtype=bool)
+    n_trades = np.zeros(B, dtype=np.int64)
+    wins = np.zeros(B, dtype=np.int64)
+    forced = np.zeros(B, dtype=np.int64)
+    sum_net = np.zeros(B)
+    day_count = np.zeros(B, dtype=np.int64)
+    exp_day = np.zeros(B, dtype=np.int64)
+    pick_count = np.zeros((B, N), dtype=np.int64)
+    cohort = np.zeros((B, N), dtype=bool)      # 本批次的成员（用于按市值加总）
+    rows_all = np.arange(B)
+
+    for t in range(1, T):
+        entered = np.zeros((B, N), dtype=bool)
+        # 【关键】批次内按「买入持有」算组合市值：不做每日再平衡
+        # v = Σ(每只当前市值) / 批次持仓数；日收益 = v_t / v_{t-1} - 1
+        v_prev = np.where(holding, (pos_cum * cohort).sum(axis=1) / np.maximum(m, 1), 1.0)
+        o_t = open_[:, :, t]            # [B, N] 当日开盘
+        c_t = close_[:, :, t]           # [B, N] 当日收盘
+        c_p = close_[:, :, t - 1]       # 前一日收盘
+        e_ok = entry_ok[:, :, t]
+        x_ok = exit_ok[:, :, t]
+
+        # ---------- 1) 空仓的样本尝试建仓（用 t-1 收盘的因子） ----------
+        idle = ~holding
+        if idle.any():
+            prev_sig = sig[:, :, t - 1]
+            elig = idle[:, None] & e_ok
+            if require_positive:
+                elig = elig & (prev_sig > 0)
+            score = np.where(elig, prev_sig, -np.inf)
+            order = np.argsort(-score, axis=1)[:, :n_top]
+            picked = np.zeros((B, N), dtype=bool)
+            picked[rows_all[:, None], order] = True
+            picked &= elig
+            cnt = picked.sum(axis=1)
+            # 【风控】合格标的不足 MIN_PICKS 就空仓，避免把全部资金压在一两只上
+            take = idle & (cnt >= MIN_PICKS)
+            if take.any():
+                active[take] = picked[take]
+                cohort[take] = picked[take]
+                pos_cum[take] = 1.0
+                m[take] = cnt[take]
+                exit_target[take] = t + hold
+                holding[take] = True
+                entered[take] = active[take]
+                pick_count[take] += picked[take]
+
+        # ---------- 2) 当日收益 ----------
+        day_ret = np.zeros((B, N))
+        will_exit = active & (t >= exit_target[:, None]) & x_ok     # 今天开盘卖
+        if will_exit.any():
+            day_ret[will_exit] = o_t[will_exit] / c_p[will_exit] - 1.0 - SELL_COST
+            forced += (will_exit & (t > exit_target[:, None])).sum(axis=1)   # 因跌停/停牌顺延
+        if entered.any():                                           # 今天开盘买
+            day_ret[entered] = c_t[entered] / o_t[entered] - 1.0 - BUY_COST
+        cont = active & (~will_exit) & (~entered)                   # 继续持有
+        if cont.any():
+            day_ret[cont] = c_t[cont] / c_p[cont] - 1.0
+
+        pos_cum = np.where(active, pos_cum * (1.0 + day_ret), pos_cum)
+        v_new = (pos_cum * cohort).sum(axis=1) / np.maximum(m, 1)   # 建仓日 m 已更新，必须重算
+        traded = holding | entered.any(axis=1)
+        daily[:, t] = np.where(traded, v_new / np.where(v_prev == 0, 1.0, v_prev) - 1.0, 0.0)
+
+        # ---------- 3) 结算卖出的仓位 ----------
+        if will_exit.any():
+            net = pos_cum - 1.0
+            n_trades += will_exit.sum(axis=1)
+            wins += ((net > 0) & will_exit).sum(axis=1)
+            sum_net += np.where(will_exit, net, 0.0).sum(axis=1)
+            active[will_exit] = False
+            pos_cum[will_exit] = 1.0
+
+        # ---------- 4) 批次结束判定 ----------
+        still = active.any(axis=1)
+        exp_day[still] += 1
+        day_count += 1
+        finished = holding & (~still)
+        holding[finished] = False
+        m[finished] = 0
+        cohort[finished] = False
+
+    return daily, {
+        "n_trades": n_trades, "wins": wins, "sum_net": sum_net,
+        "avg_net": np.where(n_trades > 0, sum_net / np.maximum(n_trades, 1), 0.0),
+        "exposure": exp_day / np.maximum(day_count, 1),
+        "forced": forced,
+        "pick_count": pick_count,
     }
 
 
@@ -761,22 +883,21 @@ class DeepQuantMiner:
                 valid[i] = True
         return results, valid
 
-    # ---------- 奖励函数：原始版核心原理的 A股落地（横截面）----------
+    # ---------- 奖励函数：Top-N 组合口径（原始版实盘 runner 的做法）----------
     def backtest(self, factors, complexity=None):
         """
-        一个公式同时在 N 只标的上回测，分数 = 各标的风险调整收益的**中位数**。
+        【核心】横截面 Top-N 组合打分。
 
-        - 中位数而不是均值：抗异常值（原版 MemeBacktest 用的就是 torch.median）
-        - 单标的门槛：交易次数 >= MIN_TRADES 且仓位暴露 >= 10%
-        - 达标标的比例 < MIN_STOCK_PASS：公式判为无效
-        - 再叠加「回撤惩罚 + 复杂度惩罚」（原版思想）
+        每天在标的池里挑因子值最高的 N 只等权持有（对应原始版 runner 的排序取前 N），
+        持有 HOLD_PERIOD 个交易日后换股。分数 = 组合日收益的年化索提诺 − 回撤惩罚 − 复杂度惩罚。
+
+        与旧做法的区别：旧做法是每只股票各自出二值信号，30 只里常同时买 14 只 ≈ 半个指数。
         """
         B, N, T = factors.shape
         if complexity is None:
             complexity = torch.zeros(B, device=DEVICE)
         split = self.engine.split_idx
         rewards = torch.zeros(B, device=DEVICE)
-        need = max(2, int(np.ceil(MIN_STOCK_PASS * N)))
 
         for s in range(0, B, BATCH_CHUNK):
             chunk = factors[s:s + BATCH_CHUNK].detach().cpu().numpy()
@@ -784,37 +905,32 @@ class DeepQuantMiner:
             if cb == 0:
                 break
             allzero = (np.abs(chunk) < 1e-12).all(axis=(1, 2))
-
             sub = chunk[:, :, :split]
-            sig = (np.tanh(sub) > 0).astype(np.float64).reshape(cb * N, split)
-            o = np.tile(self.engine.open_np[:, :split], (cb, 1))
-            c = np.tile(self.engine.close_np[:, :split], (cb, 1))
-            e_ok = np.tile(self.engine.entry_ok[:, :split], (cb, 1))
-            x_ok = np.tile(self.engine.exit_ok[:, :split], (cb, 1))
-            daily, flags, st = simulate_batch(sig, o, c, e_ok, x_ok, HOLD_PERIOD)
-            daily = daily.reshape(cb, N, split)
-            flags = flags.reshape(cb, N, split)
-            n_tr = st["n_trades"].reshape(cb, N)
+            o = np.broadcast_to(self.engine.open_np[:, :split], (cb, N, split))
+            c = np.broadcast_to(self.engine.close_np[:, :split], (cb, N, split))
+            e_ok = np.broadcast_to(self.engine.entry_ok[:, :split], (cb, N, split))
+            x_ok = np.broadcast_to(self.engine.exit_ok[:, :split], (cb, N, split))
+            daily, st = simulate_topn_batch(sub, o, c, e_ok, x_ok,
+                                            HOLD_PERIOD, TOP_N, REQUIRE_POSITIVE)
 
-            mu = daily.mean(axis=2)
-            dvol = np.sqrt((np.minimum(daily, 0.0) ** 2).mean(axis=2))
-            sortino = mu / (dvol + 1e-9) * np.sqrt(252)          # 日尺度年化索提诺
-            exposure = flags.mean(axis=2)
-            eq = np.cumprod(1.0 + daily, axis=2)
-            peak = np.maximum.accumulate(eq, axis=2)
-            maxdd = (1.0 - eq / peak).max(axis=2)
+            mu = daily.mean(axis=1)
+            dvol = np.sqrt((np.minimum(daily, 0.0) ** 2).mean(axis=1))
+            sortino = mu / (dvol + 1e-9) * np.sqrt(252)
+            eq = np.cumprod(1.0 + daily, axis=1)
+            maxdd = (1.0 - eq / np.maximum.accumulate(eq, axis=1)).max(axis=1)
+            n_tr = st["n_trades"]
+            ex = st["exposure"]
 
-            valid = (n_tr >= MIN_TRADES) & (exposure >= 0.10)
             for b in range(cb):
                 if allzero[b]:
                     rewards[s + b] = -2.0
                     continue
-                m = valid[b]
-                if int(m.sum()) < need:
+                # 风控门槛：交易次数下限 + 仓位暴露下限（防"几乎不持仓却比率虚高"）
+                if n_tr[b] < MIN_PORTFOLIO_TRADES or ex[b] < 0.10:
                     rewards[s + b] = -3.0
                     continue
-                score = float(np.median(sortino[b][m]))
-                score -= MAX_DD_PENALTY * max(0.0, float(np.median(maxdd[b][m])) - DD_THRESHOLD)
+                score = float(sortino[b])
+                score -= MAX_DD_PENALTY * max(0.0, float(maxdd[b]) - DD_THRESHOLD)
                 score -= LEN_PENALTY * float(complexity[s + b])
                 rewards[s + b] = float(np.clip(score, -5.0, 10.0))
         return rewards
@@ -966,38 +1082,50 @@ class DeepQuantMiner:
 
 
 # ==============================================================================
-# 7. 样本外检验（横截面组合口径）
+# 7. 样本外检验（Top-N 组合口径）
 # ==============================================================================
 def _name(code):
     return f"{code} {STOCK_NAMES[code]}" if code in STOCK_NAMES else code
 
 
+def _oos_portfolio(engine, factor):
+    """在样本外段跑 Top-N 组合，返回 (daily_ret, stats, dates)"""
+    split = engine.split_idx
+    N = len(engine.codes)
+    sub = factor[:, split:].detach().cpu().numpy()[None, :, :]
+    T = sub.shape[2]
+    o = np.broadcast_to(engine.open_np[:, split:], (1, N, T))
+    c = np.broadcast_to(engine.close_np[:, split:], (1, N, T))
+    e_ok = np.broadcast_to(engine.entry_ok[:, split:], (1, N, T))
+    x_ok = np.broadcast_to(engine.exit_ok[:, split:], (1, N, T))
+    daily, st = simulate_topn_batch(sub, o, c, e_ok, x_ok,
+                                    HOLD_PERIOD, TOP_N, REQUIRE_POSITIVE)
+    sq = {k: (v[0] if hasattr(v, "shape") and v.ndim >= 1 else v) for k, v in st.items()}
+    return daily[0], sq, engine.dates[split:]
+
+
 def final_reality_check(engine, miner):
-    print("\n" + "=" * 72)
-    print("样本外检验（Out-of-Sample，训练段完全未参与搜索）")
-    print("=" * 72)
+    print("\n" + "=" * 74)
+    print("样本外检验（Out-of-Sample，Top-N 组合口径，训练段完全未参与搜索）")
+    print("=" * 74)
     print(f"策略公式: {miner.decode()}")
-    print(f"标的池  : {len(engine.codes)} 只　持有周期: {HOLD_PERIOD} 交易日")
+    print(f"标的池  : {len(engine.codes)} 只　持有 {HOLD_PERIOD} 日　每次持仓 {TOP_N} 只（等权）")
     factor = miner.solve_one(miner.best_formula_tokens)
     if factor is None:
         print("公式无法执行")
         return None
 
-    split = engine.split_idx
-    # 样本外独立起算（不与训练段的仓位交叉）
-    daily, flags, st = engine.run_factor(factor, split, None)
-    dates = engine.dates[split:]
-    port = daily.mean(axis=0)                       # 等权组合
+    port, st, dates = _oos_portfolio(engine, factor)
     pst = perf_stats(port)
 
-    closes = engine.close_np[:, split:]
+    closes = engine.close_np[:, engine.split_idx:]
     bh = np.zeros(len(port))
-    bh[1:] = (closes[:, 1:] / closes[:, :-1] - 1.0).mean(axis=0)   # 等权买入持有
+    bh[1:] = (closes[:, 1:] / closes[:, :-1] - 1.0).mean(axis=0)
     bh_st = perf_stats(bh)
 
-    print("-" * 72)
+    print("-" * 74)
     print(f"样本外区间 : {dates[0].date()} ~ {dates[-1].date()}（{len(dates)} 个交易日）")
-    print(f"{'指标':<16}{'等权组合':>16}{'等权买入持有':>18}")
+    print(f"{'指标':<16}{'Top-N 组合':>16}{'等权买入持有':>18}")
     for label, key, fmt in [
         ("总收益", "total", "{:.2%}"), ("年化收益", "ann", "{:.2%}"),
         ("年化波动", "vol", "{:.2%}"), ("夏普", "sharpe", "{:.2f}"),
@@ -1005,25 +1133,27 @@ def final_reality_check(engine, miner):
         ("卡玛", "calmar", "{:.2f}"),
     ]:
         print(f"{label:<16}{fmt.format(pst[key]):>16}{fmt.format(bh_st[key]):>18}")
-    print("-" * 72)
-    print(f"{'标的':<16}{'交易':>5}{'胜率':>9}{'净收益':>11}{'索提诺':>9}{'最大回撤':>10}{'暴露':>8}")
-    for i, code in enumerate(engine.codes):
-        n = int(st["n_trades"][i]); w = int(st["wins"][i])
-        s = perf_stats(daily[i])
-        wr = f"{w / n:.0%}" if n else "-"
-        print(f"{_name(code):<16}{n:>5}{wr:>9}{s['total']:>10.2%}"
-              f"{s['sortino']:>9.2f}{s['max_dd']:>10.2%}{flags[i].mean():>8.0%}")
-    print("-" * 72)
-    tot = int(st["n_trades"].sum()); win = int(st["wins"].sum())
-    print(f"组合合计: {tot} 笔交易，整体胜率 {win / tot:.1%}" if tot else "组合合计: 无交易")
-    print("=" * 72)
-    print("说明：单公式、单标的池、日线级别、不含组合优化与仓位管理；历史回测不代表未来。")
+    n_tr = int(st["n_trades"]); n_win = int(st["wins"])
+    print("-" * 74)
+    if n_tr:
+        print(f"交易 {n_tr} 笔　胜率 {n_win / n_tr:.1%}　"
+              f"平均单笔净收益 {float(st['avg_net']):.2%}　仓位暴露 {float(st['exposure']):.0%}　"
+              f"因跌停/停牌顺延 {int(st['forced'])} 次")
+    else:
+        print(f"样本外无交易（合格标的长期少于 MIN_PICKS={MIN_PICKS}）　"
+              f"仓位暴露 {float(st['exposure']):.0%}")
+    picks = st["pick_count"]
+    order = np.argsort(-picks)[:12]
+    print("被选中次数最多的标的: " +
+          "、".join(f"{_name(engine.codes[i])}×{int(picks[i])}" for i in order if picks[i] > 0))
+    print("=" * 74)
+    print("说明：Top-N 等权组合、日线级别；不含仓位动态调整与行业中性；历史回测不代表未来。")
 
     try:
         fig, axes = plt.subplots(1, 2, figsize=(13, 4.6),
                                  gridspec_kw={"width_ratios": [1.7, 1]})
-        axes[0].plot(dates, pst["equity"], label="Strategy (equal-weight)")
-        axes[0].plot(dates, bh_st["equity"], label="Buy & Hold", alpha=0.7)
+        axes[0].plot(dates, pst["equity"], label=f"Top-{TOP_N} Strategy")
+        axes[0].plot(dates, bh_st["equity"], label="Equal-weight Buy & Hold", alpha=0.7)
         axes[0].set_title(f"OOS: Ann {pst['ann']:.1%} | Sortino {pst['sortino']:.2f} | "
                           f"MaxDD {pst['max_dd']:.1%}")
         axes[0].grid(alpha=0.3); axes[0].legend()
@@ -1062,60 +1192,71 @@ def next_trading_day(after):
 
 
 def report_latest(engine, miner, n_days=10):
+    """每日推送：Top-N 选股名单 + 组合样本外表现"""
     factor = miner.solve_one(miner.best_formula_tokens)
-    split = engine.split_idx
-    daily, flags, st = engine.run_factor(factor, split, None)
-    dates = engine.dates[split:]
-    port = daily.mean(axis=0)
+    port, st, dates = _oos_portfolio(engine, factor)
     pst = perf_stats(port)
-
     f_np = factor.detach().cpu().numpy()
-    sig_now = np.tanh(f_np[:, -1]) > 0
-    sig_prev = np.tanh(f_np[:, -2]) > 0
-    buys = [engine.codes[i] for i in range(len(engine.codes)) if sig_now[i]]
+    N = len(engine.codes)
 
     last_date = pd.Timestamp(dates[-1])
     exec_date = next_trading_day(last_date)
     today = pd.Timestamp(datetime.today().date())
     if last_date < today - pd.Timedelta(days=1) and exec_date <= today:
-        print(f"\n[!] 注意：最新数据日期 {last_date.date()}，执行日 {exec_date.date()} 可能已过，"
-              f"请确认数据源是否滞后")
+        print(f"\n[!] 数据日期 {last_date.date()}，执行日 {exec_date.date()} 可能已过，请检查数据源")
 
-    print(f"\n{'='*72}\n最新信号：{last_date.date()} 收盘 → 执行日 {exec_date.date()} 开盘\n{'='*72}")
-    print(f"{'标的':<16}{'信号':<8}{'前一日':<8}{'当前可买':<10}{'因子值':>10}")
-    for i, code in enumerate(engine.codes):
-        print(f"{_name(code):<16}{'买入' if sig_now[i] else '—':<8}"
-              f"{'买入' if sig_prev[i] else '—':<8}"
-              f"{'是' if engine.entry_ok[i, -1] else '否':<10}{f_np[i, -1]:>10.3f}")
-    print("-" * 72)
-    if buys:
-        print(f"→ {exec_date.date()} 开盘买入 {len(buys)} 只: " + "、".join(_name(c) for c in buys))
-    else:
-        print(f"→ {exec_date.date()} 无买入信号（空仓/继续持有现有仓位）")
-    print(f"样本外组合（等权）: 累计 {pst['total']:.2%} | 年化 {pst['ann']:.2%} | "
+    # ---- 下一批选股（复现模拟器的决策逻辑）----
+    sig_last = np.tanh(f_np[:, -1])
+    elig = engine.entry_ok[:, -1].copy()
+    if REQUIRE_POSITIVE:
+        elig = elig & (sig_last > 0)
+    score = np.where(elig, sig_last, -np.inf)
+    order = np.argsort(-score)[:TOP_N]
+    picks = [int(i) for i in order if elig[i]]
+
+    print(f"\n{'='*74}\n信号：{last_date.date()} 收盘　→　执行日 {exec_date.date()} 开盘"
+          f"（Top-{TOP_N} 等权）\n{'='*74}")
+    print(f"{'排名':<6}{'标的':<18}{'因子值':>10}{'当日可买':>10}")
+    for rank, i in enumerate(picks, 1):
+        print(f"{rank:<6}{_name(engine.codes[i]):<18}{f_np[i, -1]:>10.3f}"
+              f"{'是' if engine.entry_ok[i, -1] else '否':>10}")
+    if not picks:
+        print("（无满足条件的标的 → 空仓）")
+    print("-" * 74)
+    n_tr = int(st["n_trades"]); n_win = int(st["wins"])
+    print(f"样本外组合：累计 {pst['total']:.2%} | 年化 {pst['ann']:.2%} | "
           f"索提诺 {pst['sortino']:.2f} | 最大回撤 {pst['max_dd']:.2%}")
+    print(f"　　　　　　　交易 {n_tr} 笔 | 胜率 {n_win / n_tr:.1%} | 仓位暴露 {st['exposure']:.0%}"
+          if n_tr else "　　　　　　　样本外无交易")
 
     # ---- 钉钉 ----
-    lines = [f"## 📊 AlphaGPT v2 [{len(engine.codes)}只池]", ""]
+    lines = [f"## 📊 AlphaGPT Top-{TOP_N} [{len(engine.codes)}只池]", ""]
     lines.append(f"**信号：{last_date.date()} 收盘**  →  **执行：{exec_date.date()} 开盘**")
-    if buys:
-        for c in buys:
-            lines.append(f"- ✅ 买入 **{_name(c)}**")
-        lines.append(f"\n共 {len(buys)}/{len(engine.codes)} 只触发买入")
+    if picks:
+        lines.append("")
+        lines.append(f"### 买入名单（等权 {100.0 / len(picks):.0f}% / 只）")
+        for rank, i in enumerate(picks, 1):
+            lines.append(f"{rank}. **{_name(engine.codes[i])}**　因子值 {f_np[i, -1]:.3f}")
+        lines.append("")
+        lines.append(f"共 {len(picks)}/{len(engine.codes)} 只入选")
     else:
-        lines.append("- ⬜ 无买入信号（空仓观望）")
+        lines.append("")
+        lines.append("⬜ **无入选标的 → 空仓**")
     lines.append("")
     lines.append(f"**公式**：`{miner.decode()}`　**持有**：{HOLD_PERIOD} 个交易日")
     lines.append("")
-    lines.append("### 📈 样本外等权组合")
+    lines.append("### 📈 样本外组合")
     lines.append(f"- 累计收益 **{pst['total']:.2%}**　年化 {pst['ann']:.2%}")
     lines.append(f"- 索提诺 {pst['sortino']:.2f}　夏普 {pst['sharpe']:.2f}　"
                  f"最大回撤 {pst['max_dd']:.2%}")
-    tot = int(st["n_trades"].sum())
-    if tot:
-        lines.append(f"- 样本外共 {tot} 笔交易，胜率 {int(st['wins'].sum())/tot:.1%}")
+    if n_tr:
+        lines.append(f"- 交易 {n_tr} 笔　胜率 {n_win / n_tr:.1%}　仓位暴露 {st['exposure']:.0%}")
     lines.append("")
-    lines.append("> 已含佣金/过户费/印花税/滑点；开盘涨停买不进、跌停顺延、停牌跳过。")
+    lines.append("> 已含佣金/过户费/印花税/滑点；开盘涨停不买入、跌停顺延、停牌跳过。")
+    if pst["total"] < 0:
+        lines.append(">")
+        lines.append("> ⚠️ **研究性质，非投资建议**：该公式在样本外为负收益、跑输等权买入持有，"
+                     "尚未验证出稳定超额收益。")
     send_dingtalk_msg("\n".join(lines))
     return pst, st
 
