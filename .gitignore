@@ -19,3 +19,7 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# v2 运行产物
+margin_universe_cache.parquet
+strategy_performance_v2.png
