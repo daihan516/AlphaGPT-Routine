@@ -48,6 +48,8 @@ jobs:
           # --- v2 横截面参数 ---
           UNIVERSE: ${{ vars.UNIVERSE || '600519,600036,601318,600030,600276,600887,601899,600900,601088,600309,601166,600585' }}
           HOLD_PERIOD: ${{ vars.HOLD_PERIOD || 5 }}
+          TOP_N: ${{ vars.TOP_N || 5 }}
+          MIN_PICKS: ${{ vars.MIN_PICKS || 3 }}
           SEED: ${{ vars.SEED || 42 }}
           MIN_TRADES: ${{ vars.MIN_TRADES || 12 }}
           MIN_STOCK_PASS: ${{ vars.MIN_STOCK_PASS || 0.9 }}
